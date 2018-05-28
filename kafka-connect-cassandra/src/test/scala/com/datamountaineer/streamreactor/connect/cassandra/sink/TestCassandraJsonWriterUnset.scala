@@ -1,6 +1,7 @@
 package com.datamountaineer.streamreactor.connect.cassandra.sink
 
 import java.util.UUID
+
 import com.datamountaineer.streamreactor.connect.cassandra.TestConfig
 import com.datamountaineer.streamreactor.connect.cassandra.config.CassandraConfigConstants
 import com.datastax.driver.core.Session
@@ -9,7 +10,7 @@ import org.apache.kafka.connect.sink.{SinkRecord, SinkTaskContext}
 import org.mockito.Mockito.when
 import org.scalatest.mockito.MockitoSugar
 import org.scalatest.{BeforeAndAfterAll, DoNotDiscover, Matchers, WordSpec}
-import org.apache.kafka.connect.data.{Schema, SchemaBuilder}
+import org.apache.kafka.connect.data.{Schema, SchemaBuilder, Struct}
 
 import scala.collection.JavaConverters._
 
@@ -37,6 +38,53 @@ class TestCassandraJsonWriterUnset
   }
 
   "a Cassandra json unset feature" should {
+    "pre-existing values overridden if using Struct schema" in {
+      val table = "A" + UUID.randomUUID().toString.replace("-", "_")
+      val context = mock[SinkTaskContext]
+      when(context.assignment()).thenReturn(getAssignment)
+      session.execute(
+        s"""CREATE TABLE IF NOT EXISTS $keyspace.$table (
+        id text PRIMARY KEY
+        , col_a bigint
+        , col_b bigint)""")
+
+      val schema = SchemaBuilder.struct
+        .field("id", Schema.STRING_SCHEMA)
+        .field("col_a", Schema.INT64_SCHEMA)
+        .field("col_b", Schema.OPTIONAL_INT64_SCHEMA)
+        .build()
+
+      val config = Map(
+        CassandraConfigConstants.CONTACT_POINTS -> contactPoint,
+        CassandraConfigConstants.KEY_SPACE -> keyspace,
+        CassandraConfigConstants.USERNAME -> userName,
+        CassandraConfigConstants.PASSWD -> password,
+        CassandraConfigConstants.KCQL -> s"INSERT INTO $table SELECT * FROM TOPIC",
+        CassandraConfigConstants.DEFAULT_VALUE_SERVE_STRATEGY_PROPERTY -> "UNSET"
+      ).asJava
+
+      val (init, part) = (
+        new SinkRecord("TOPIC", 0, Schema.STRING_SCHEMA, "key", schema, new Struct(schema).put("id", "1").put("col_a", 4L).put("col_b", 5L),
+          0, System.currentTimeMillis(), TimestampType.LOG_APPEND_TIME),
+        new SinkRecord("TOPIC", 0, Schema.STRING_SCHEMA, "key", schema, new Struct(schema).put("id", "1").put("col_a", 6L),
+          0, System.currentTimeMillis(), TimestampType.LOG_APPEND_TIME)
+      )
+
+      val task = new CassandraSinkTask()
+      task.initialize(context)
+      task.start(config)
+      task.put(Seq(init).asJava)
+      task.put(Seq(part).asJava)
+      task.stop()
+
+      val res = session.execute(s"SELECT * FROM $keyspace.$table")
+      val row = res.one()
+      System.out.println(row)
+      row.getLong("col_a") shouldBe 6L
+      row.getLong("col_b") shouldBe 0L //not equal to 5L
+
+    }
+
     "pre-existing values will be preserved " in {
       val colA_expected = 3L
       val colB_expected = 5L
